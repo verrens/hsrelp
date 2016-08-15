@@ -43,6 +43,7 @@ data RelpMessage = RelpMessage
 
 type RelpOffers = [(ByteString, ByteString)]
 
+
 -- | Provides a simple RELP server.
 runRelpServer :: PortNumber -- ^ Port to listen on
   -> RelpMessageHandler -- ^ Message handler
@@ -55,54 +56,6 @@ runRelpServer port cb = withSocketsDo $ do
   handleConnection sock
   sClose sock
   where
-
-  relpRsp :: Socket -> RelpMessage -> String -> IO ()
-  relpRsp sock msg reply = sendAll sock mkReply
-    -- putStrLn $ prettyHex $ B8.toStrict mkReply
-    where
-    mkReply = B8.pack $ (show $ relpTxnr msg) ++ " rsp "
-      ++ (show $ length reply) ++ " " ++ reply ++ "\n"
-
-  relpAck :: Socket -> RelpMessage -> IO ()
-  relpAck sock msg = relpRsp sock msg "200 OK"
-
-  relpNAck :: Socket -> RelpMessage -> String -> IO ()
-  relpNAck sock msg err = relpRsp sock msg $ "500 " ++ err
-
-  relpParser :: Parser RelpMessage
-  relpParser = do
-    txnr <- decimal <* space
-    command <- parseCommand <* space
-    datalen <- decimal <* space
-    content <- take (datalen + 1) -- <* trailer
-    return $ RelpMessage txnr command content
-    where
-    decimal :: Integral a => Parser a
-    decimal = B.foldl' step 0 `fmap` takeWhile1 isDecimal where
-      step a c = a * 10 + fromIntegral (c - 48)
-      isDecimal c = c >= 48 && c <= 57
-    space = word8 32
-    trailer = word8 10
-    parseCommand =
-      string "syslog" *> return RelpSYSLOG
-      <|> string "close" *> return RelpCLOSE
-      <|> string "open" *> return RelpOPEN
-      <|> string "rsp" *> return RelpRSP
-      <|> RelpCommand <$> takeWhile1 (/= 32)
-
-  relpOffersParser :: Parser RelpOffers 
-  relpOffersParser = many' $ pair <* word8 sep
-    where
-    sep = 10 -- \n
-    der = 61 -- '='
-    pair = liftA2 (,)
-      (takeWhile1 (\c-> c /= der && c /= sep))
-      (word8 der *> takeWhile1 (/= sep) <|> return "")
-
-  -- just shortcuts
-  parse_ err ok p = either err ok . parseOnly p
-  parseLazy_ err ok p = either err ok . LBP.eitherResult . LBP.parse p
-
 
   handleConnection sock = do
     accept sock >>= forkIO . handleMessage
@@ -138,3 +91,51 @@ runRelpServer port cb = withSocketsDo $ do
       putStrLn ("ERROR: strange message command: " ++ show msg)
       relpNAck sock msg "unexpected message command"
       return False
+
+
+relpParser :: Parser RelpMessage
+relpParser = do
+  txnr <- decimal <* space
+  command <- parseCommand <* space
+  datalen <- decimal <* space
+  content <- take (datalen + 1) -- <* trailer
+  return $ RelpMessage txnr command content
+  where
+  decimal :: Integral a => Parser a
+  decimal = B.foldl' step 0 `fmap` takeWhile1 isDecimal where
+    step a c = a * 10 + fromIntegral (c - 48)
+    isDecimal c = c >= 48 && c <= 57
+  space = word8 32
+  trailer = word8 10
+  parseCommand =
+    string "syslog" *> return RelpSYSLOG
+    <|> string "close" *> return RelpCLOSE
+    <|> string "open" *> return RelpOPEN
+    <|> string "rsp" *> return RelpRSP
+    <|> RelpCommand <$> takeWhile1 (/= 32)
+
+relpOffersParser :: Parser RelpOffers 
+relpOffersParser = many' $ pair <* word8 sep
+  where
+  sep = 10 -- \n
+  der = 61 -- '='
+  pair = liftA2 (,)
+    (takeWhile1 (\c-> c /= der && c /= sep))
+    (word8 der *> takeWhile1 (/= sep) <|> return "")
+
+relpRsp :: Socket -> RelpMessage -> String -> IO ()
+relpRsp sock msg reply = sendAll sock mkReply
+  -- putStrLn $ prettyHex $ B8.toStrict mkReply
+  where
+  mkReply = B8.pack $ (show $ relpTxnr msg) ++ " rsp "
+    ++ (show $ length reply) ++ " " ++ reply ++ "\n"
+
+relpAck :: Socket -> RelpMessage -> IO ()
+relpAck sock msg = relpRsp sock msg "200 OK"
+
+relpNAck :: Socket -> RelpMessage -> String -> IO ()
+relpNAck sock msg err = relpRsp sock msg $ "500 " ++ err
+
+-- just shortcuts
+parse_ err ok p = either err ok . parseOnly p
+parseLazy_ err ok p = either err ok . LBP.eitherResult . LBP.parse p

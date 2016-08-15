@@ -1,6 +1,5 @@
 name:                hsrelp
-version:             0.1.0.0
-x-revision: 4
+version:             0.1.0.1
 synopsis:            RELP (Reliable Event Logging Protocol) server implementation
 description:         
   The specification of the RELP protocol:
