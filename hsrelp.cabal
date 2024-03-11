@@ -1,5 +1,5 @@
 name:                hsrelp
-version:             0.1.0.1
+version:             0.1.1.1
 synopsis:            RELP (Reliable Event Logging Protocol) server implementation
 description:         
   The specification of the RELP protocol:
@@ -11,7 +11,6 @@ license:             BSD3
 license-file:        LICENSE
 author:              Denis Afonin <verrens@yandex.ru>
 maintainer:          Denis Afonin <verrens@yandex.ru>
-copyright:           (c) 2016 Denis Afonin
 category:            Network
 build-type:          Simple
 -- extra-source-files:  
@@ -21,7 +20,8 @@ library
   -- other-modules:       
   -- other-extensions:    
   build-depends:    base >= 4 && < 5,
-                    network,
+                    network >= 3.0,
+                    network-bsd >= 2.8,
                     bytestring,
                     utf8-string,
                     attoparsec

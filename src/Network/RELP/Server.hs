@@ -22,6 +22,8 @@ import Data.Char
 import Data.List (lookup)
 import Control.Applicative
 import Control.Monad
+import qualified Control.Exception as E
+import Control.Concurrent (forkFinally)
 
 -- | Message handler callback.
 type RelpMessageHandler =
@@ -48,15 +50,7 @@ type RelpOffers = [(ByteString, ByteString)]
 runRelpServer :: PortNumber -- ^ Port to listen on
   -> RelpMessageHandler -- ^ Message handler
   -> IO () -- ^ Never returns
-runRelpServer port cb = withSocketsDo $ do
-  sock <- socket AF_INET Stream defaultProtocol
-  setSocketOption sock ReuseAddr 1
-  bindSocket sock (SockAddrInet port iNADDR_ANY)
-  listen sock 3
-  handleConnection sock
-  sClose sock
-  where
-
+runRelpServer port cb = runTCPServer Nothing port handleConnection where
   handleConnection sock = do
     accept sock >>= forkIO . handleMessage
     handleConnection sock
@@ -91,6 +85,27 @@ runRelpServer port cb = withSocketsDo $ do
       putStrLn ("ERROR: strange message command: " ++ show msg)
       relpNAck sock msg "unexpected message command"
       return False
+
+  runTCPServer :: Maybe HostName -> PortNumber -> (Socket -> IO a) -> IO a
+  runTCPServer mhost port server = withSocketsDo $ do
+      addr <- resolve
+      E.bracket (open addr) close loop
+    where
+      resolve = do
+          let hints = defaultHints {
+                  addrFlags = [AI_PASSIVE]
+                , addrSocketType = Stream
+                }
+          head <$> getAddrInfo (Just hints) mhost (Just $ show port)
+      open addr = E.bracketOnError (openSocket addr) close $ \sock -> do
+          setSocketOption sock ReuseAddr 1
+          withFdSocket sock setCloseOnExecIfNeeded
+          bind sock $ addrAddress addr
+          listen sock 1024
+          return sock
+      loop sock = forever $ E.bracketOnError (accept sock) (close . fst)
+          $ \(conn, _peer) -> void $
+              forkFinally (server conn) (const $ gracefulClose conn 5000)
 
 
 relpParser :: Parser RelpMessage
