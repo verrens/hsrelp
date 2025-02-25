@@ -11,7 +11,7 @@ module Network.RELP.Server
 import Prelude hiding (getContents, take)
 import Network.Socket hiding (send, recv)
 import Network.Socket.ByteString.Lazy
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, forkFinally)
 import Data.Attoparsec.ByteString
 import qualified Data.Attoparsec.ByteString.Lazy as LBP
 import qualified Data.ByteString.Lazy.Char8 as B8
@@ -19,11 +19,11 @@ import qualified Data.ByteString as B
 import Data.ByteString (ByteString)
 import Data.ByteString.UTF8 (toString)
 import Data.Char
+import Data.Functor
 import Data.List (lookup)
 import Control.Applicative
 import Control.Monad
 import qualified Control.Exception as E
-import Control.Concurrent (forkFinally)
 
 -- | Message handler callback.
 type RelpMessageHandler =
@@ -51,14 +51,10 @@ runRelpServer :: PortNumber -- ^ Port to listen on
   -> RelpMessageHandler -- ^ Message handler
   -> IO () -- ^ Never returns
 runRelpServer port cb = runTCPServer Nothing port handleConnection where
-  handleConnection sock = do
-    accept sock >>= forkIO . handleMessage
-    handleConnection sock
-
+  handleConnection sock peer = handleMessage (sock, peer)
   handleMessage s@(sockh, srcAddr) = do
     status <- getContents sockh >>= processMessage s
-    if status then handleMessage s
-      else close sockh
+    if status then handleMessage s else close sockh
 
   processMessage (sock, srcAddr) = parseLazy_ err process relpParser
     where
@@ -67,12 +63,12 @@ runRelpServer port cb = runTCPServer Nothing port handleConnection where
     process msg@RelpMessage{ relpCommand = RelpOPEN } = do
       let offers = parse_ (const []) id relpOffersParser $ relpData msg
       -- NOTE only version 0 supported!
-      let versionValid = maybe False (== "0") $ lookup "relp_version" offers
+      let versionValid = (Just "0" ==) $ lookup "relp_version" offers
       -- TODO FIXME check commands offer?
       if versionValid then do
           relpRsp sock msg $ "200 OK "
             ++ "relp_version=0\nrelp_software=hsRELP\ncommands="
-            ++ (maybe "syslog" toString $ lookup "commands" offers)
+            ++ maybe "syslog" toString (lookup "commands" offers)
           return True
         else relpNAck sock msg "unsupported RELP version" >> return False
 
@@ -86,7 +82,6 @@ runRelpServer port cb = runTCPServer Nothing port handleConnection where
       relpNAck sock msg "unexpected message command"
       return False
 
-  runTCPServer :: Maybe HostName -> PortNumber -> (Socket -> IO a) -> IO a
   runTCPServer mhost port server = withSocketsDo $ do
       addr <- resolve
       E.bracket (open addr) close loop
@@ -104,8 +99,8 @@ runRelpServer port cb = runTCPServer Nothing port handleConnection where
           listen sock 1024
           return sock
       loop sock = forever $ E.bracketOnError (accept sock) (close . fst)
-          $ \(conn, _peer) -> void $
-              forkFinally (server conn) (const $ gracefulClose conn 5000)
+          $ \(conn, peer) -> void $
+              forkFinally (server conn peer) (const $ gracefulClose conn 5000)
 
 
 relpParser :: Parser RelpMessage
@@ -113,7 +108,7 @@ relpParser = do
   txnr <- decimal <* space
   command <- parseCommand <* space
   datalen <- decimal <* space
-  content <- take (datalen + 1) -- <* trailer
+  content <- take datalen
   return $ RelpMessage txnr command content
   where
   decimal :: Integral a => Parser a
@@ -123,13 +118,13 @@ relpParser = do
   space = word8 32
   trailer = word8 10
   parseCommand =
-    string "syslog" *> return RelpSYSLOG
-    <|> string "close" *> return RelpCLOSE
-    <|> string "open" *> return RelpOPEN
-    <|> string "rsp" *> return RelpRSP
+    string "syslog" $> RelpSYSLOG
+    <|> string "close" $> RelpCLOSE
+    <|> string "open" $> RelpOPEN
+    <|> string "rsp" $> RelpRSP
     <|> RelpCommand <$> takeWhile1 (/= 32)
 
-relpOffersParser :: Parser RelpOffers 
+relpOffersParser :: Parser RelpOffers
 relpOffersParser = many' $ pair <* word8 sep
   where
   sep = 10 -- \n
@@ -142,8 +137,8 @@ relpRsp :: Socket -> RelpMessage -> String -> IO ()
 relpRsp sock msg reply = sendAll sock mkReply
   -- putStrLn $ prettyHex $ B8.toStrict mkReply
   where
-  mkReply = B8.pack $ (show $ relpTxnr msg) ++ " rsp "
-    ++ (show $ length reply) ++ " " ++ reply ++ "\n"
+  mkReply = B8.pack $ show (relpTxnr msg) ++ " rsp "
+    ++ show (length reply) ++ " " ++ reply ++ "\n"
 
 relpAck :: Socket -> RelpMessage -> IO ()
 relpAck sock msg = relpRsp sock msg "200 OK"
