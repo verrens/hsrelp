@@ -1,12 +1,9 @@
 -- | RELP (Reliable Event Logging Protocol) simple server
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE MonoLocalBinds #-}
+{-# LANGUAGE OverloadedStrings, RecordWildCards, ScopedTypeVariables #-}
 module Network.RELP.Server
   (
     -- * Running a standalone RELP server
-    RelpMessageHandler
+    RelpServerOpts(..), RelpMessageHandler
   , runRelpServer
   , runTLSServer, runTLSServer'
   , RelpFlow
@@ -20,29 +17,47 @@ import Network.Socket (PortNumber, AddrInfo(..),
 import qualified Network.Socket as S
 import Network.Socket.ByteString.Lazy ( getContents, sendAll )
 import qualified Data.ByteString as B
-import Network.Simple.TCP.TLS
 import Network.TLS
+import Network.Simple.TCP.TLS
 import Data.X509.CertificateStore
 import Data.Attoparsec.ByteString (parseOnly, string, take,
   takeWhile1, word8, many', Parser)
 import qualified Data.Attoparsec.ByteString.Lazy as LBP
 import qualified Data.ByteString.Lazy.Char8 as B8
+import Data.Default
 import Data.ByteString (ByteString)
 import Data.ByteString.UTF8 (toString)
 import Data.Functor ( ($>), (<&>), void )
 import Control.Applicative ( Alternative((<|>)) )
 import Control.Monad (forever)
-import Control.Monad.IO.Class
-
-import Control.Monad.Catch
+import Control.Concurrent
 import System.IO hiding (getContents)
+import Control.Exception (SomeException)
 import qualified Control.Exception as E
 
+-- | Relp server options
+data RelpFlow s =>  RelpServerOpts s = RelpServerPrefs
+  { relpServerReport :: s -> SockAddr -> String -> String -> IO ()
+  , relpServerAccept :: s -> SockAddr -> RelpOffers -> IO Bool
+  , relpServerNotify :: s -> RelpMessageHandler
+  , relpServerReduce :: s -> SockAddr -> IO ()
+  , relpServerFinish :: s -> SockAddr -> IO ()
+  }
+
+-- | Relp server options stub
+instance RelpFlow s => Default (RelpServerOpts s) where
+  def = RelpServerPrefs
+    (\_ a t -> hPutStrLn stderr . ((show a <> " " <> t <> ": ")<>))
+    (\_ _ _ -> pure True)
+    (\_ _ _ -> pure True)
+    (\_ _ -> pure ())
+    (\_ _ -> pure ())
+
 -- | Message handler callback.
-type RelpMessageHandler m = Monad m => 
+type RelpMessageHandler =
   SockAddr -- ^ Client connection address
   -> ByteString -- ^ Log message
-  -> m Bool -- ^ Reject message (reply error RSP) if False
+  -> IO Bool -- ^ Reject message (reply error RSP) if False
 
 data RelpCommand = RelpRSP | RelpOPEN | RelpSYSLOG | RelpCLOSE
   | RelpCommand ByteString
@@ -57,14 +72,14 @@ data RelpMessage = RelpMessage
 type RelpOffers = [(ByteString, ByteString)]
 
 class RelpFlow a where
-  flowRecv :: (MonadMask m, MonadIO m) => a -> m B8.ByteString
-  flowSend :: (MonadMask m, MonadIO m) => a -> B8.ByteString -> m ()
-  flowClose :: (MonadMask m, MonadIO m) => a -> m ()
+  flowRecv :: a -> IO B8.ByteString
+  flowSend :: a -> B8.ByteString -> IO ()
+  flowClose :: a -> IO ()
 
 instance RelpFlow Socket where
-  flowRecv = liftIO . getContents
-  flowSend s = liftIO . sendAll s
-  flowClose = liftIO . S.close
+  flowRecv = getContents
+  flowSend = sendAll
+  flowClose = S.close
 
 instance RelpFlow Context where
   flowRecv = fmap B8.fromStrict . recvData
@@ -72,8 +87,10 @@ instance RelpFlow Context where
   flowClose = bye
 
 -- | Provides a simple RELP server.
-runRelpServer :: PortNumber -> RelpMessageHandler IO -> IO ()
-runRelpServer portnum = runTCPServer Nothing portnum . buildRelpServerHandle where
+runRelpServer :: PortNumber -> RelpMessageHandler -> IO ()
+runRelpServer portnum hdl = srv where
+  srv = runTCPServer Nothing portnum shl
+  shl = buildRelpServerHandle def{relpServerNotify = const hdl}
   runTCPServer mhost port server = withSocketsDo $ do
       addr <- resolve
       E.bracket (open addr) S.close loop
@@ -92,60 +109,64 @@ runRelpServer portnum = runTCPServer Nothing portnum . buildRelpServerHandle whe
           return sock
       loop sock = forever $ E.bracketOnError (S.accept sock) (S.close . fst)
           $ \(conn, peer) -> void $
-              E.finally (server conn peer) (S.gracefulClose conn 5000)
+              forkFinally (server conn peer) (const (S.gracefulClose conn 5000))
 
 -- | Provides a simple TLS RELP server.
-runTLSServer' :: (MonadIO m, MonadMask m) => FilePath -> FilePath -> FilePath
-              -> ServiceName -> (SockAddr -> ByteString -> m Bool) -> m ()
-runTLSServer' fca fcr fky snm cb = liftIO lcrd >>= \cr ->
-  liftIO (readCertificateStore fca) >>= \ca ->
+runTLSServer' :: FilePath -> FilePath -> FilePath
+              -> ServiceName -> RelpServerOpts Context -> IO ()
+runTLSServer' fca fcr fky snm cb = lcrd >>= \cr ->
+  readCertificateStore fca >>= \ca ->
   runTLSServer (makeServerParams cr ca) HostAny snm cb where
     lcrd = credentialLoadX509Chain fcr [fca] fky <&> either (error . show) id
 
 -- | Provides a TLS RELP server
-runTLSServer :: (MonadMask m, MonadIO m) => ServerParams -> HostPreference
-             -> String -> RelpMessageHandler m -> m ()
-runTLSServer params hostprefs servicename server = srv where
-  srv = listen hostprefs servicename (\(sock, _peer) -> accept params sock open)
-  open (ctx, peer) = do
-    liftIO (hPutStrLn stderr (" …" <> show peer))
-    buildRelpServerHandle server ctx peer
+runTLSServer :: ServerParams -> HostPreference
+             -> String -> RelpServerOpts Context -> IO ()
+runTLSServer params hostprefs servicename opts = srv where
+  srv = listen hostprefs servicename acp
+  acp (sock, _peer) = forever (acceptFork params sock opn)
+  opn (ctx, peer) = buildRelpServerHandle opts ctx peer
 
 -- | Build relp messages handler.
-buildRelpServerHandle :: (MonadIO m, MonadMask m, RelpFlow sock)
-                      => RelpMessageHandler m -- ^ Message handler
-                      -> sock -- ^ Server socket
+buildRelpServerHandle :: RelpFlow s
+                      => RelpServerOpts s -- ^ Server options
+                      -> s -- ^ Some server socket
                       -> SockAddr -- ^ Client address
-                      -> m () -- ^ Never returns
-buildRelpServerHandle cb = handleMessage where
-  handleMessage sock srcAddr = do
-    status <- flowRecv sock >>= processMessage sock srcAddr
-    if status then handleMessage sock srcAddr else flowClose sock
+                      -> IO () -- ^ Never returns
+buildRelpServerHandle RelpServerPrefs{..} = safeRun where
+  safeRun s a = E.try (handleMessage s a) >>= check s a
 
-  processMessage sock srcAddr = parseLazy_ err process relpParser
-    where
-    err e = liftIO (hPutStrLn stderr ("ERROR: parser: " ++ show e) >> return False)
+  check s a (Right ()) = relpServerFinish s a
+  check s a (Left (e :: SomeException)) =
+    relpServerReport s a "ERROR" (show e) >> relpServerFinish s a
 
+  handleMessage s a = do
+    status <- flowRecv s >>= processMessage s a
+    if status then handleMessage s a else handleClose s a
+  
+  handleClose s a = relpServerReduce s a >> flowClose s
+
+  processMessage s a = parseLazy_ err process relpParser where
+    err e = relpServerReport s a "ERROR" ("parser: " ++ show e) $> False
     process msg@RelpMessage{ relpCommand = RelpOPEN, relpData = txt } = do
       let offers = parse_ (const []) id relpOffersParser txt
       -- NOTE only version 0 supported!
       let versionValid = (Just "0" ==) $ lookup "relp_version" offers
-      -- TODO FIXME check commands offer?
       if versionValid then do
-          relpRsp sock msg $ "200 OK "
+          relpRsp s msg $ "200 OK "
             ++ "relp_version=0\nrelp_software=hsRELP\ncommands="
             ++ maybe "syslog" toString (lookup "commands" offers)
-          return True
-        else relpNAck sock msg "unsupported RELP version" >> return False
-
+          relpServerAccept s a offers
+        else do
+          relpServerReport s a "ERROR" ("unsupported version " <> show offers)
+          relpNAck s msg "unsupported RELP version" >> return False
     process msg@RelpMessage{ relpCommand = RelpSYSLOG, relpData = txt } = do
-      status <- cb srcAddr txt
-      if status then relpAck sock msg else relpNAck sock msg "rejected"
+      status <- relpServerNotify s a txt
+      if status then relpAck s msg else relpNAck s msg "rejected"
       return status
-
     process msg = do
-      liftIO (hPutStrLn stderr ("ERROR: strange message command: " ++ show msg))
-      relpNAck sock msg "unexpected message command"
+      relpServerReport s a "ERROR" ("strange message command: " ++ show msg)
+      relpNAck s msg "unexpected message command"
       return False
 
 relpParser :: Parser RelpMessage
@@ -177,17 +198,17 @@ relpOffersParser = many' $ pair <* word8 sep
     (takeWhile1 (\c-> c /= der && c /= sep))
     (word8 der *> takeWhile1 (/= sep) <|> return "")
 
-relpRsp :: (MonadIO m, MonadMask m, RelpFlow s) => s -> RelpMessage -> String -> m ()
+relpRsp :: RelpFlow s => s -> RelpMessage -> String -> IO ()
 relpRsp sock msg reply = flowSend sock mkReply
   -- putStrLn $ prettyHex $ B8.toStrict mkReply
   where
   mkReply = B8.pack $ show (relpTxnr msg) ++ " rsp "
     ++ show (length reply) ++ " " ++ reply ++ "\n"
 
-relpAck :: (MonadIO m, MonadMask m, RelpFlow s) => s -> RelpMessage -> m ()
+relpAck :: RelpFlow s => s -> RelpMessage -> IO ()
 relpAck sock msg = relpRsp sock msg "200 OK"
 
-relpNAck :: (MonadIO m, MonadMask m, RelpFlow s) => s -> RelpMessage -> String -> m ()
+relpNAck :: RelpFlow s => s -> RelpMessage -> String -> IO ()
 relpNAck sock msg err = relpRsp sock msg $ "500 " ++ err
 
 -- just shortcuts
