@@ -1,6 +1,6 @@
 cabal-version:       3.4
 name:                hsrelp
-version:             0.1.4.1
+version:             0.2.1.1
 synopsis:            RELP (Reliable Event Logging Protocol) server implementation
 description:         
   The specification of the RELP protocol:

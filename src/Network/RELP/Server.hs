@@ -3,10 +3,10 @@
 module Network.RELP.Server
   (
     -- * Running a standalone RELP server
-    RelpServerOpts(..), RelpMessageHandler
+    RelpServerParams(..)
   , runRelpServer
-  , runTLSServer, runTLSServer'
-  , RelpFlow
+  , runRelpTLSServer, runRelpTLSServer'
+  , RelpFlow(..)
   , buildRelpServerHandle
   )
   where
@@ -36,61 +36,54 @@ import Control.Exception (SomeException)
 import qualified Control.Exception as E
 
 -- | Relp server options
-data RelpFlow s =>  RelpServerOpts s = RelpServerPrefs
-  { relpServerReport :: s -> SockAddr -> String -> String -> IO ()
-  , relpServerAccept :: s -> SockAddr -> RelpOffers -> IO Bool
-  , relpServerNotify :: s -> RelpMessageHandler
-  , relpServerReduce :: s -> SockAddr -> IO ()
-  , relpServerFinish :: s -> SockAddr -> IO ()
+data RelpFlow s =>  RelpServerParams s = RelpServerParams
+  { relpServerReport :: !(s -> SockAddr -> String -> String -> IO ())
+  , relpServerAccept :: !(s -> SockAddr -> RelpOffers -> IO Bool)
+  , relpServerNotify :: !(s -> SockAddr -> ByteString -> IO Bool)
+  , relpServerReduce :: !(s -> SockAddr -> IO ())
+  , relpServerFinish :: !(s -> SockAddr -> IO ())
   }
 
 -- | Relp server options stub
-instance RelpFlow s => Default (RelpServerOpts s) where
-  def = RelpServerPrefs
+instance RelpFlow s => Default (RelpServerParams s) where
+  def = RelpServerParams
     (\_ a t -> hPutStrLn stderr . ((show a <> " " <> t <> ": ")<>))
     (\_ _ _ -> pure True)
     (\_ _ _ -> pure True)
     (\_ _ -> pure ())
     (\_ _ -> pure ())
 
--- | Message handler callback.
-type RelpMessageHandler =
-  SockAddr -- ^ Client connection address
-  -> ByteString -- ^ Log message
-  -> IO Bool -- ^ Reject message (reply error RSP) if False
-
 data RelpCommand = RelpRSP | RelpOPEN | RelpSYSLOG | RelpCLOSE
   | RelpCommand ByteString
   deriving (Show, Eq)
 
 data RelpMessage = RelpMessage
-  { relpTxnr :: Int
-  , relpCommand :: RelpCommand
-  , relpData :: ByteString
+  { relpTxnr :: !Int
+  , relpCommand :: !RelpCommand
+  , relpData :: !ByteString
   } deriving (Show, Eq)
 
 type RelpOffers = [(ByteString, ByteString)]
 
 class RelpFlow a where
-  flowRecv :: a -> IO B8.ByteString
-  flowSend :: a -> B8.ByteString -> IO ()
-  flowClose :: a -> IO ()
+  relpFlowRecv :: a -> IO B8.ByteString
+  relpFlowSend :: a -> B8.ByteString -> IO ()
+  relpFlowClose :: a -> IO ()
 
 instance RelpFlow Socket where
-  flowRecv = getContents
-  flowSend = sendAll
-  flowClose = S.close
+  relpFlowRecv = getContents
+  relpFlowSend = sendAll
+  relpFlowClose = S.close
 
 instance RelpFlow Context where
-  flowRecv = fmap B8.fromStrict . recvData
-  flowSend = sendData
-  flowClose = bye
+  relpFlowRecv = fmap B8.fromStrict . recvData
+  relpFlowSend = sendData
+  relpFlowClose = bye
 
 -- | Provides a simple RELP server.
-runRelpServer :: PortNumber -> RelpMessageHandler -> IO ()
-runRelpServer portnum hdl = srv where
-  srv = runTCPServer Nothing portnum shl
-  shl = buildRelpServerHandle def{relpServerNotify = const hdl}
+runRelpServer :: PortNumber -> RelpServerParams Socket -> IO ()
+runRelpServer portnum opts = srv where
+  srv = runTCPServer Nothing portnum (buildRelpServerHandle opts)
   runTCPServer mhost port server = withSocketsDo $ do
       addr <- resolve
       E.bracket (open addr) S.close loop
@@ -112,28 +105,29 @@ runRelpServer portnum hdl = srv where
               forkFinally (server conn peer) (const (S.gracefulClose conn 5000))
 
 -- | Provides a simple TLS RELP server.
-runTLSServer' :: FilePath -> FilePath -> FilePath
-              -> ServiceName -> RelpServerOpts Context -> IO ()
-runTLSServer' fca fcr fky snm cb = lcrd >>= \cr ->
+runRelpTLSServer' :: FilePath -> FilePath -> FilePath
+              -> (ServerParams -> ServerParams)
+              -> ServiceName -> RelpServerParams Context -> IO ()
+runRelpTLSServer' fca fcr fky fhp snm cb = lcrd >>= \cr ->
   readCertificateStore fca >>= \ca ->
-  runTLSServer (makeServerParams cr ca) HostAny snm cb where
+  runRelpTLSServer (fhp (makeServerParams cr ca)) HostAny snm cb where
     lcrd = credentialLoadX509Chain fcr [fca] fky <&> either (error . show) id
 
 -- | Provides a TLS RELP server
-runTLSServer :: ServerParams -> HostPreference
-             -> String -> RelpServerOpts Context -> IO ()
-runTLSServer params hostprefs servicename opts = srv where
+runRelpTLSServer :: ServerParams -> HostPreference
+             -> String -> RelpServerParams Context -> IO ()
+runRelpTLSServer params hostprefs servicename opts = srv where
   srv = listen hostprefs servicename acp
   acp (sock, _peer) = forever (acceptFork params sock opn)
   opn (ctx, peer) = buildRelpServerHandle opts ctx peer
 
 -- | Build relp messages handler.
 buildRelpServerHandle :: RelpFlow s
-                      => RelpServerOpts s -- ^ Server options
+                      => RelpServerParams s -- ^ Server options
                       -> s -- ^ Some server socket
                       -> SockAddr -- ^ Client address
                       -> IO () -- ^ Never returns
-buildRelpServerHandle RelpServerPrefs{..} = safeRun where
+buildRelpServerHandle RelpServerParams{..} = safeRun where
   safeRun s a = E.try (handleMessage s a) >>= check s a
 
   check s a (Right ()) = relpServerFinish s a
@@ -141,10 +135,10 @@ buildRelpServerHandle RelpServerPrefs{..} = safeRun where
     relpServerReport s a "ERROR" (show e) >> relpServerFinish s a
 
   handleMessage s a = do
-    status <- flowRecv s >>= processMessage s a
+    status <- relpFlowRecv s >>= processMessage s a
     if status then handleMessage s a else handleClose s a
   
-  handleClose s a = relpServerReduce s a >> flowClose s
+  handleClose s a = relpServerReduce s a >> relpFlowClose s
 
   processMessage s a = parseLazy_ err process relpParser where
     err e = relpServerReport s a "ERROR" ("parser: " ++ show e) $> False
@@ -199,7 +193,7 @@ relpOffersParser = many' $ pair <* word8 sep
     (word8 der *> takeWhile1 (/= sep) <|> return "")
 
 relpRsp :: RelpFlow s => s -> RelpMessage -> String -> IO ()
-relpRsp sock msg reply = flowSend sock mkReply
+relpRsp sock msg reply = relpFlowSend sock mkReply
   -- putStrLn $ prettyHex $ B8.toStrict mkReply
   where
   mkReply = B8.pack $ show (relpTxnr msg) ++ " rsp "
